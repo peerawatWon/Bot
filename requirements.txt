@@ -1,2 +1,4 @@
 twitchio==2.10.0
 python-dotenv
+aiohttp
+psycopg2-binary
