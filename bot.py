@@ -78,13 +78,14 @@ count = load_count()
 mod_bot: "ModBot | None" = None
 
 
-async def handle_ping(request):
+async def handle_ping(_request):
     return web.Response(text="OK")
 
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
