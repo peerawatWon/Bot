@@ -107,6 +107,7 @@ class Bot(commands.Bot):
             return
         if message.author and message.author.name.lower() == self.nick.lower():
             return
+        print(f"[msg] {message.author.name if message.author else '?'}: {message.content}")
         if "ห์" in message.content:
             msg_id = getattr(message, "id", None)
             if msg_id:
