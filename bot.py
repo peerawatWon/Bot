@@ -107,6 +107,8 @@ class Bot(commands.Bot):
             return
         if message.author and message.author.name.lower() == self.nick.lower():
             return
+        if message.author and message.author.name.lower() == "nightbot":
+            return
         if "ห์" in message.content:
             msg_id = getattr(message, "id", None)
             if msg_id:
@@ -132,13 +134,14 @@ class ModBot(commands.Bot):
         print(f"ModBot พร้อมแล้ว | ใช้สำหรับ shoutout")
 
     async def event_raid(self, channel, raider, viewer_count):
-        print(f"[raid] {raider.name} มา raid ด้วย {viewer_count} คน")
+        name = raider.name if hasattr(raider, "name") else raider
+        print(f"[raid] {name} มา raid ด้วย {viewer_count} คน")
         try:
-            await channel.send(f"!so {raider.name}")
-            print(f"!so {raider.name}")
+            await channel.send(f"!so {name}")
+            print(f"!so {name}")
             await asyncio.sleep(1)
-            await channel.send(f"/shoutout {raider.name}")
-            print(f"/shoutout {raider.name}")
+            await channel.send(f"/shoutout {name}")
+            print(f"/shoutout {name}")
         except Exception as e:
             print(f"[raid error] {type(e).__name__}: {e}")
 
