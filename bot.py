@@ -20,10 +20,28 @@ PORT = int(os.getenv("PORT", 5000))
 
 DB_KEY = "haw_count"
 TRIGGER = "ห์"
+# the counter only runs in this one channel, even if CHANNEL lists more
+COUNTER_CHANNEL = os.getenv("COUNTER_CHANNEL", "maddiefumi").lower()
 SHOUTOUT_DEDUP_SEC = 300
 
 seen_ids: deque[str] = deque(maxlen=500)
 recent_shoutouts: dict[str, float] = {}
+
+
+def parse_logins(raw: str | None) -> list[str]:
+    """'x,y z' / '@x, @y' -> ['x', 'y', ...], duplicates dropped, order kept."""
+    if not raw:
+        return []
+    out: list[str] = []
+    for part in raw.replace(",", " ").split():
+        login = part.strip().lstrip("@").lower()
+        if login and login not in out:
+            out.append(login)
+    return out
+
+
+# CHANNEL may list several channels, e.g. CHANNEL="x,y,z"
+CHANNELS = parse_logins(CHANNEL)
 
 
 # --- storage ---------------------------------------------------------------
@@ -94,14 +112,16 @@ async def start_web_server() -> None:
 
 class CounterBot(commands.Bot):
     def __init__(self, count: int):
-        super().__init__(token=TOKEN, prefix="!", initial_channels=[CHANNEL])
+        super().__init__(token=TOKEN, prefix="!", initial_channels=CHANNELS)
         self.count = count
 
     async def event_ready(self):
-        print(f"[counter] ready in #{CHANNEL} | count={self.count}")
+        print(f"[counter] ready, counting only in #{COUNTER_CHANNEL} | count={self.count}")
 
     def _should_skip(self, message: twitchio.Message) -> bool:
         if message.echo or not message.author:
+            return True
+        if message.channel.name.lower() != COUNTER_CHANNEL:
             return True
         return message.author.name.lower() in (self.nick.lower(), "nightbot")
 
@@ -132,11 +152,12 @@ class CounterBot(commands.Bot):
 
 class ModBot(commands.Bot):
     def __init__(self):
-        super().__init__(token=MOD_TOKEN, prefix="!", initial_channels=[CHANNEL])
+        super().__init__(token=MOD_TOKEN, prefix="!", initial_channels=CHANNELS)
         self._raw_token = MOD_TOKEN.replace("oauth:", "")
         self.client_id: str | None = None
         self.moderator_id: str | None = None
-        self.broadcaster_id: str | None = None
+        # one broadcaster id per channel we look after
+        self.broadcaster_ids: dict[str, str] = {}
 
     @property
     def _helix_headers(self) -> dict[str, str]:
@@ -144,7 +165,7 @@ class ModBot(commands.Bot):
 
     @property
     def _ids_ready(self) -> bool:
-        return bool(self.client_id and self.moderator_id and self.broadcaster_id)
+        return bool(self.client_id and self.moderator_id and self.broadcaster_ids)
 
     async def event_ready(self):
         print("[mod] ready")
@@ -169,9 +190,14 @@ class ModBot(commands.Bot):
                     print("[mod] token missing moderator:manage:shoutouts — "
                           "official shoutout will fail, !so still works")
 
-                self.broadcaster_id = await self._user_id(sess, CHANNEL)
+                for chan in CHANNELS:
+                    chan_id = await self._user_id(sess, chan)
+                    if chan_id:
+                        self.broadcaster_ids[chan] = chan_id
+                    else:
+                        print(f"[mod] unknown channel in CHANNEL: {chan}")
 
-            print(f"[mod] ids resolved | broadcaster={self.broadcaster_id} "
+            print(f"[mod] ids resolved | broadcasters={self.broadcaster_ids} "
                   f"moderator={self.moderator_id}")
         except Exception as e:
             print(f"[mod] resolve error: {type(e).__name__}: {e}")
@@ -185,12 +211,17 @@ class ModBot(commands.Bot):
             users = (await r.json()).get("data") or []
         return users[0]["id"] if users else None
 
-    async def _helix_shoutout(self, login: str) -> None:
+    async def _helix_shoutout(self, from_channel: str, login: str) -> None:
         """The real /shoutout, which IRC no longer accepts as a chat command."""
         if not self._ids_ready:
             await self._resolve_ids()
         if not self._ids_ready:
             print("[shoutout] ids unavailable, skipping helix call")
+            return
+
+        from_id = self.broadcaster_ids.get(from_channel)
+        if not from_id:
+            print(f"[shoutout] no broadcaster id for #{from_channel}")
             return
 
         try:
@@ -203,28 +234,31 @@ class ModBot(commands.Bot):
                 async with sess.post(
                     "https://api.twitch.tv/helix/chat/shoutouts",
                     params={
-                        "from_broadcaster_id": self.broadcaster_id,
+                        "from_broadcaster_id": from_id,
                         "to_broadcaster_id": to_id,
                         "moderator_id": self.moderator_id,
                     },
                     headers=self._helix_headers,
                 ) as r:
                     if r.status == 204:
-                        print(f"[shoutout] helix ok: {login}")
+                        print(f"[shoutout] helix ok: #{from_channel} -> {login}")
                     else:
                         # 400 = channel offline, 429 = still on cooldown
-                        print(f"[shoutout] helix {r.status}: {await r.text()}")
+                        print(f"[shoutout] helix {r.status} (#{from_channel}): "
+                              f"{await r.text()}")
         except Exception as e:
             print(f"[shoutout] error: {type(e).__name__}: {e}")
 
     async def do_shoutout(self, channel, login: str, send_chat: bool = True) -> None:
         login = login.lstrip("@")
         now = time.time()
-        last = recent_shoutouts.get(login.lower())
+        # dedupe per channel, so the same guest can be shouted out on each one
+        key = f"{channel.name.lower()}:{login.lower()}"
+        last = recent_shoutouts.get(key)
         if last and now - last < SHOUTOUT_DEDUP_SEC:
-            print(f"[shoutout] skip {login}, done {int(now - last)}s ago")
+            print(f"[shoutout] skip {login} in #{channel.name}, done {int(now - last)}s ago")
             return
-        recent_shoutouts[login.lower()] = now
+        recent_shoutouts[key] = now
 
         if send_chat:
             try:
@@ -234,7 +268,7 @@ class ModBot(commands.Bot):
 
         # Give the chat bot time to post its blurb before the native shoutout.
         await asyncio.sleep(2)
-        await self._helix_shoutout(login)
+        await self._helix_shoutout(channel.name.lower(), login)
 
     async def event_raw_usernotice(self, channel, tags: dict):
         if tags.get("msg-id") != "raid":
