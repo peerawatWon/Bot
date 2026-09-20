@@ -20,8 +20,9 @@ PORT = int(os.getenv("PORT", 5000))
 
 DB_KEY = "haw_count"
 TRIGGER = "ห์"
-# the counter only runs in this one channel, even if CHANNEL lists more
-COUNTER_CHANNEL = os.getenv("COUNTER_CHANNEL", "maddiefumi").lower()
+# the counter joins this channel only; every other channel in CHANNEL is
+# shoutout-only and the counter never connects to it
+COUNTER_CHANNEL = (os.getenv("COUNTER_CHANNEL") or "maddiefumi").strip().lstrip("@").lower()
 SHOUTOUT_DEDUP_SEC = 300
 
 seen_ids: deque[str] = deque(maxlen=500)
@@ -40,7 +41,8 @@ def parse_logins(raw: str | None) -> list[str]:
     return out
 
 
-# CHANNEL may list several channels, e.g. CHANNEL="x,y,z"
+# CHANNEL may list several channels, e.g. CHANNEL="x,y,z" — these are the
+# channels the shoutout bot looks after
 CHANNELS = parse_logins(CHANNEL)
 
 
@@ -112,15 +114,18 @@ async def start_web_server() -> None:
 
 class CounterBot(commands.Bot):
     def __init__(self, count: int):
-        super().__init__(token=TOKEN, prefix="!", initial_channels=CHANNELS)
+        # join the counter channel only, so the trigger bot never reads chat in
+        # the shoutout-only channels
+        super().__init__(token=TOKEN, prefix="!", initial_channels=[COUNTER_CHANNEL])
         self.count = count
 
     async def event_ready(self):
-        print(f"[counter] ready, counting only in #{COUNTER_CHANNEL} | count={self.count}")
+        print(f"[counter] ready in #{COUNTER_CHANNEL} | count={self.count}")
 
     def _should_skip(self, message: twitchio.Message) -> bool:
         if message.echo or not message.author:
             return True
+        # guard in case a stray JOIN puts us in another channel
         if message.channel.name.lower() != COUNTER_CHANNEL:
             return True
         return message.author.name.lower() in (self.nick.lower(), "nightbot")
@@ -270,6 +275,22 @@ class ModBot(commands.Bot):
         await asyncio.sleep(2)
         await self._helix_shoutout(channel.name.lower(), login)
 
+    def _is_privileged(self, author, channel) -> bool:
+        """Echo messages can carry a partial author with no badges, so fall back
+        to the bot's own nick and the channel owner."""
+        if getattr(author, "is_mod", False) or getattr(author, "is_broadcaster", False):
+            return True
+        name = (getattr(author, "name", "") or "").lower()
+        return name in (self.nick.lower(), channel.name.lower())
+
+    async def event_message(self, message: twitchio.Message):
+        # The mod token is the same account a human types from, so its messages
+        # arrive flagged as echo — twitchio would drop them before commands run.
+        # do_shoutout's dedup keeps the bot's own "!so <login>" from looping.
+        if not message.author:
+            return
+        await self.handle_commands(message)
+
     async def event_raw_usernotice(self, channel, tags: dict):
         if tags.get("msg-id") != "raid":
             return
@@ -282,7 +303,7 @@ class ModBot(commands.Bot):
 
     @commands.command(name="so")
     async def cmd_so(self, ctx: commands.Context, target: str = None):
-        if not target or not (ctx.author.is_mod or ctx.author.is_broadcaster):
+        if not target or not self._is_privileged(ctx.author, ctx.channel):
             return
         # The mod's own message already triggered the chat !so, so don't repeat it.
         await self.do_shoutout(ctx.channel, target, send_chat=False)
