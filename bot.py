@@ -24,6 +24,8 @@ TRIGGER = "ห์"
 # shoutout-only and the counter never connects to it
 COUNTER_CHANNEL = (os.getenv("COUNTER_CHANNEL") or "maddiefumi").strip().lstrip("@").lower()
 SHOUTOUT_DEDUP_SEC = 300
+# how often the shoutout bot checks it is still in every channel
+CHANNEL_CHECK_SEC = 60
 
 seen_ids: deque[str] = deque(maxlen=500)
 recent_shoutouts: dict[str, float] = {}
@@ -157,12 +159,18 @@ class CounterBot(commands.Bot):
 
 class ModBot(commands.Bot):
     def __init__(self):
-        super().__init__(token=MOD_TOKEN, prefix="!", initial_channels=CHANNELS)
+        # pass a copy: twitchio removes a channel from this list for good when a
+        # JOIN times out, and it is also the list it rejoins after a reconnect
+        super().__init__(token=MOD_TOKEN, prefix="!", initial_channels=list(CHANNELS))
         self._raw_token = MOD_TOKEN.replace("oauth:", "")
         self.client_id: str | None = None
         self.moderator_id: str | None = None
         # one broadcaster id per channel we look after
         self.broadcaster_ids: dict[str, str] = {}
+        # channel -> id() of the websocket the JOIN was confirmed on; a new
+        # websocket after a reconnect makes every entry stale until rejoined
+        self._joined: dict[str, int] = {}
+        self._watchdog: asyncio.Task | None = None
 
     @property
     def _helix_headers(self) -> dict[str, str]:
@@ -174,7 +182,61 @@ class ModBot(commands.Bot):
 
     async def event_ready(self):
         print("[mod] ready")
+        if not self._watchdog or self._watchdog.done():
+            self._watchdog = asyncio.create_task(self._channel_watchdog())
         await self._resolve_ids()
+
+    # --- staying in every channel ------------------------------------------
+
+    def _ws_id(self) -> int | None:
+        ws = getattr(self._connection, "_websocket", None)
+        return id(ws) if ws is not None and not ws.closed else None
+
+    def _missing_channels(self) -> list[str]:
+        ws_id = self._ws_id()
+        if ws_id is None:
+            return []  # offline, twitchio is reconnecting on its own
+        return [c for c in CHANNELS if self._joined.get(c) != ws_id]
+
+    def _keep_in_initial(self, channels: list[str]) -> None:
+        """Put channels back on twitchio's rejoin list if it dropped them."""
+        initial = self._connection._initial_channels
+        for chan in channels:
+            if chan not in initial:
+                initial.append(chan)
+
+    async def _channel_watchdog(self) -> None:
+        while True:
+            await asyncio.sleep(CHANNEL_CHECK_SEC)
+            try:
+                missing = self._missing_channels()
+                self._keep_in_initial(missing)
+                if missing:
+                    print(f"[mod] not in {missing}, rejoining")
+                    await self.join_channels(missing)
+            except Exception as e:
+                print(f"[mod] watchdog error: {type(e).__name__}: {e}")
+
+    async def event_channel_joined(self, channel):
+        name = channel.name.lower()
+        self._joined[name] = self._ws_id()
+        print(f"[mod] joined #{name}")
+
+    async def event_channel_join_failure(self, channel: str):
+        # twitchio has already dropped it from the rejoin list; the watchdog
+        # puts it back and retries
+        print(f"[mod] join failed: #{channel}, retrying in {CHANNEL_CHECK_SEC}s")
+        self._joined.pop(channel.lower(), None)
+        self._keep_in_initial([channel.lower()])
+
+    async def event_part(self, user):
+        if user.name and user.name.lower() == self.nick.lower() and user.channel:
+            name = user.channel.name.lower()
+            self._joined.pop(name, None)
+            print(f"[mod] parted #{name}")
+
+    async def event_reconnect(self):
+        print("[mod] twitch asked to reconnect")
 
     async def _resolve_ids(self) -> None:
         """Read client_id/user_id off the token, then look up the channel's id."""
